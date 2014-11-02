@@ -17,7 +17,7 @@ impl PacketHeader {
         Ok(())
     }
 
-    fn read_from<R: Reader>(&self, r: &mut R) -> IoResult<PacketHeader> {
+    fn read_from<R: Reader>(r: &mut R) -> IoResult<PacketHeader> {
         Ok(PacketHeader {
             seq: try!(r.read_u8()),
             ack: try!(r.read_u8())
@@ -26,7 +26,7 @@ impl PacketHeader {
 }
 
 pub struct NetChannel {
-    incoming_datagrams: Receiver<IoResult<Vec<u8>>>,
+    incoming_datagrams: Receiver<Vec<u8>>,
     outgoing_datagrams: Sender<Vec<u8>>,
 
     incoming_seq: SequenceNr,
@@ -37,21 +37,21 @@ pub struct NetChannel {
     reliable_data: Option<Vec<u8>>
 }
 
+#[deriving(Show)]
 pub enum RecvError {
-    IoFailed(std::io::IoError),
     TaskDied
 }
 
 impl NetChannel {
-    pub fn new_from_channels(incoming_datagrams: Receiver<IoResult<Vec<u8>>>,
+    pub fn new_from_channels(incoming_datagrams: Receiver<Vec<u8>>,
                              outgoing_datagrams: Sender<Vec<u8>>) -> NetChannel {
         NetChannel {
             incoming_datagrams: incoming_datagrams,
             outgoing_datagrams: outgoing_datagrams,
 
-            incoming_seq: 0,
+            incoming_seq: -1,
             outgoing_seq: 0,
-            outgoing_seq_acked: 0,
+            outgoing_seq_acked: -1,
 
             inflight: RingBuf::new(),
             reliable_data: None,
@@ -85,6 +85,8 @@ impl NetChannel {
             let datagram = buf.unwrap();
             self.outgoing_datagrams.send(datagram);
 
+            self.inflight.push(header);
+
             Ok(header.seq)
         };
 
@@ -95,22 +97,64 @@ impl NetChannel {
         result
     }
     
-    fn parse_datagram<'a>(&mut self, datagram: &'a [u8]) -> Result<&'a [u8], ()> {
+    fn parse_datagram<'a>(&mut self, datagram: &'a [u8]) -> IoResult<(PacketHeader, Vec<u8>)> {
         let mut buf = std::io::BufReader::new(datagram);
 
-        
-        unimplemented!()
+        let header = PacketHeader::read_from(&mut buf);
+
+        let payload = buf.read_to_end();
+
+        Ok((try!(header), try!(payload)))
     }
 
+    fn is_header_valid(&self, header: &PacketHeader) -> bool {
+        use self::sequence::overflow_aware_compare;
+
+        if overflow_aware_compare(header.seq, self.incoming_seq) == Greater {
+            overflow_aware_compare(header.ack, self.outgoing_seq) != Greater // can't ack in the future
+        } else {
+            false
+        }
+    }
+
+    fn ack(&mut self, header: &PacketHeader) {
+        use self::sequence::overflow_aware_compare;
+
+        self.incoming_seq = header.seq;
+        self.outgoing_seq_acked = header.ack;
+
+        while !self.inflight.is_empty() {
+            let oldest = match self.inflight.front() {
+                Some(&PacketHeader { seq: seq, ..}) => seq,
+                None => break
+            };
+
+            if overflow_aware_compare(header.seq, self.incoming_seq) == Greater {
+                break
+            } else {
+                self.inflight.pop_front();
+            }
+        }
+    }
     pub fn recv(&mut self) -> Result<Vec<Vec<u8>>, RecvError> {
         let mut messages = Vec::new();
         loop {
             match self.incoming_datagrams.try_recv() {
-                Ok(Ok(datagram)) => {
-                    self.parse_datagram(datagram.as_slice()).map(|msg| messages.push(msg.to_vec()));
-                },
-                Ok(Err(e)) => {
-                    return Err(IoFailed(e));
+                Ok(datagram) => {
+                    match self.parse_datagram(datagram.as_slice()) {
+                        Ok((header, payload)) => {
+                            if self.is_header_valid(&header) {
+                                self.ack(&header);
+
+                                messages.push(payload);
+                            } else {
+                                // bad packet header
+                            }
+                        },
+                        Err(_) => {
+                            // corrupt packet or something
+                        }
+                    }
                 },
                 Err(std::comm::Empty) => {
                     break;
@@ -129,5 +173,33 @@ impl NetChannel {
             seq: self.outgoing_seq,
             ack: self.incoming_seq
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::NetChannel;
+
+    fn build_netchannel() -> (NetChannel, Sender<Vec<u8>>, Receiver<Vec<u8>>) {
+        let (outgoing_tx, outgoing_rx) = channel();
+        let (incoming_tx, incoming_rx) = channel();
+
+        (
+            NetChannel::new_from_channels(incoming_rx, outgoing_tx),
+            incoming_tx,
+            outgoing_rx
+        )
+    }
+
+    #[test]
+    fn smoke_netchannel() {
+        let (mut chan1, _, packets_rx1) = build_netchannel();
+        let (mut chan2, packets_tx2, _) = build_netchannel();
+
+
+        chan1.transmit(b"Candygram!", false).unwrap();
+        packets_tx2.send(packets_rx1.try_recv().unwrap());
+
+        assert_eq!(chan2.recv().unwrap()[0].as_slice(), b"Candygram!");
     }
 }
