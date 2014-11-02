@@ -1,5 +1,5 @@
 use std;
-use std::collections::{Deque, RingBuf};
+use std::collections::{RingBuf};
 use std::io::IoResult;
 pub use self::sequence::SequenceNr;
 
@@ -25,6 +25,11 @@ impl PacketHeader {
     }
 }
 
+struct PacketInfo {
+    header: PacketHeader,
+    sent_time: f64,
+}
+
 pub struct NetChannel {
     incoming_datagrams: Receiver<Vec<u8>>,
     outgoing_datagrams: Sender<Vec<u8>>,
@@ -33,8 +38,10 @@ pub struct NetChannel {
     outgoing_seq: SequenceNr,
     outgoing_seq_acked: SequenceNr,
 
-    inflight: RingBuf<PacketHeader>,
-    reliable_data: Option<Vec<u8>>
+    inflight: RingBuf<PacketInfo>,
+
+    latency: f64,
+    dropped_packets: u64
 }
 
 #[deriving(Show)]
@@ -54,47 +61,32 @@ impl NetChannel {
             outgoing_seq_acked: -1,
 
             inflight: RingBuf::new(),
-            reliable_data: None,
+
+            latency: 0.,
+            dropped_packets: 0
         }
     }
 
-    // Err if you try to send a reliable message while there is already one
-    // outstanding
-    pub fn transmit(&mut self, msg: &[u8], reliable: bool) -> Result<SequenceNr, &'static str> {
-        let result = {
-            let msg = match self.reliable_data {
-                Some(_) if reliable => {
-                    return Err("Trying to send a reliable message, but there is one unacknowledged!");
-                },
-                Some(ref reliable_msg) => {
-                    // reliable message makes us silently drop the unreliable
-                    // message we're "supposed" to transmit
-                    reliable_msg.as_slice()
-                },
-                None => msg // nothing reliable, send the unreliable stuff
-            };
+    pub fn transmit(&mut self, msg: &[u8]) -> SequenceNr {
+        let header = self.create_header();
 
-            let header = self.create_header();
+        // TODO: This allocates every time we send a packet, which isn't great
+        let mut buf = std::io::MemWriter::new();
 
-            // TODO: This allocates every time we send a packet, which isn't great
-            let mut buf = std::io::MemWriter::new();
+        header.write_to(&mut buf).unwrap();
+        buf.write(msg).unwrap();
 
-            header.write_to(&mut buf).unwrap();
-            buf.write(msg).unwrap();
+        let datagram = buf.unwrap();
+        self.outgoing_datagrams.send(datagram);
 
-            let datagram = buf.unwrap();
-            self.outgoing_datagrams.send(datagram);
+        self.inflight.push(PacketInfo {
+            header: header,
+            sent_time: ::time::precise_time_s()
+        });
 
-            self.inflight.push(header);
+        self.outgoing_seq += 1;
 
-            Ok(header.seq)
-        };
-
-        if result.is_ok() {
-            self.outgoing_seq += 1;
-        }
-
-        result
+        header.seq
     }
     
     fn parse_datagram<'a>(&mut self, datagram: &'a [u8]) -> IoResult<(PacketHeader, Vec<u8>)> {
@@ -123,15 +115,23 @@ impl NetChannel {
         self.incoming_seq = header.seq;
         self.outgoing_seq_acked = header.ack;
 
+        let curtime = ::time::precise_time_s();
+        let mut dropped = 0u64;
+
         while !self.inflight.is_empty() {
-            let oldest = self.inflight.front().map(|&PacketHeader{ seq, .. }| seq).unwrap();
+            let oldest = self.inflight.front().map(|pkt| pkt.header.seq).unwrap();
 
             if overflow_aware_compare(oldest, header.seq) == Greater {
                 break
             } else {
-                self.inflight.pop_front();
+                let PacketInfo { sent_time, ..} = self.inflight.pop_front().unwrap();
+
+                self.latency = curtime - sent_time;
+                dropped += 1;
             }
         }
+
+        self.dropped_packets = dropped;
     }
     pub fn recv(&mut self) -> Result<Vec<Vec<u8>>, RecvError> {
         let mut messages = Vec::new();
@@ -171,6 +171,12 @@ impl NetChannel {
             ack: self.incoming_seq
         }
     }
+
+    pub fn is_acknowledged(&self, seq: SequenceNr) -> bool {
+        use self::sequence::overflow_aware_compare;
+
+        overflow_aware_compare(self.outgoing_seq_acked, seq) != Greater
+    }
 }
 
 #[cfg(test)]
@@ -190,13 +196,20 @@ mod test {
 
     #[test]
     fn smoke_netchannel() {
-        let (mut chan1, _, packets_rx1) = build_netchannel();
-        let (mut chan2, packets_tx2, _) = build_netchannel();
+        let (mut chan1, packets_tx1, packets_rx1) = build_netchannel();
+        let (mut chan2, packets_tx2, packets_rx2) = build_netchannel();
 
 
-        chan1.transmit(b"Candygram!", false).unwrap();
+        let seq = chan1.transmit(b"Candygram!");
         packets_tx2.send(packets_rx1.try_recv().unwrap());
 
         assert_eq!(chan2.recv().unwrap()[0].as_slice(), b"Candygram!");
+        
+        chan2.transmit(b"Candygram!");
+        packets_tx1.send(packets_rx2.try_recv().unwrap());
+
+        assert_eq!(chan1.recv().unwrap()[0].as_slice(), b"Candygram!");
+
+        assert!(chan1.is_acknowledged(seq));
     }
 }
