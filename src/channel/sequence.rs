@@ -24,5 +24,5 @@ fn test_compare() {
     test_sequential(0);
     test_sequential(42);
     test_sequential(SEQUENCE_NR_MAX);
-    test_sequential(SEQUENCE_NR_MIN);
+    test_sequential(-1);
 }
