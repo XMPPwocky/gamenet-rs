@@ -124,12 +124,9 @@ impl NetChannel {
         self.outgoing_seq_acked = header.ack;
 
         while !self.inflight.is_empty() {
-            let oldest = match self.inflight.front() {
-                Some(&PacketHeader { seq: seq, ..}) => seq,
-                None => break
-            };
+            let oldest = self.inflight.front().map(|&PacketHeader{ seq, .. }| seq).unwrap();
 
-            if overflow_aware_compare(header.seq, self.incoming_seq) == Greater {
+            if overflow_aware_compare(oldest, header.seq) == Greater {
                 break
             } else {
                 self.inflight.pop_front();
