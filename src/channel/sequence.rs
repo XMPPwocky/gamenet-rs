@@ -1,6 +1,5 @@
 pub type SequenceNr = u8;
 pub static SEQUENCE_NR_MAX: SequenceNr = ::std::u8::MAX;
-pub static SEQUENCE_NR_MIN: SequenceNr = ::std::u8::MIN;
 
 pub fn overflow_aware_compare(a: SequenceNr, b: SequenceNr) -> Ordering {
     use std::cmp::{max, min};
